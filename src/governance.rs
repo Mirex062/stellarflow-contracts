@@ -4,6 +4,8 @@ use crate::{ContractData, ContractError, DATA_KEY, SIGNERS_KEY};
 const BALLOT_TTL_LEDGERS: u32 = 17_280;
 const BALLOT_TTL_THRESHOLD: u32 = 5_000;
 
+const PROPOSAL_TTL_SECONDS: u64 = 604_800;
+
 pub(crate) const GOVERNANCE_UPGRADE_KEY: Symbol = symbol_short!("GOVUPG");
 pub(crate) const GOVERNANCE_CONFIG_KEY: Symbol = symbol_short!("GVNCFG");
 pub(crate) const SIGNER_WEIGHTS_KEY: Symbol = symbol_short!("SIGWT");
@@ -58,6 +60,8 @@ pub enum ProposalState {
     Executed,
     /// Proposal was vetoed by the Security Council (terminal state).
     Vetoed,
+    /// Proposal expired because threshold approval was not reached within 7 days.
+    Expired,
 }
 
 /// Get multi-signature weight configuration for WASM upgrade governance
@@ -313,6 +317,22 @@ pub fn close_ballot(env: &Env, proposal_id: Symbol) {
 
 pub fn verify_block_height(target_height: u32, active_index: u32) -> bool {
     target_height > active_index
+}
+
+/// Returns true when a proposal has been active for at least 7 days without approval.
+pub fn is_proposal_expired(proposed_at: u64, current_time: u64, threshold_met: bool) -> bool {
+    !threshold_met && current_time.saturating_sub(proposed_at) >= PROPOSAL_TTL_SECONDS
+}
+
+pub fn cleanup_expired_proposal(env: &Env, proposal_id: Symbol) -> Result<Option<Address>, ContractError> {
+    let ballot = get_ballot(env, proposal_id.clone()).ok_or(ContractError::NoActiveProposal)?;
+    let threshold_met = verify_upgrade_quorum(env, &ballot.votes.keys()).is_ok();
+    if !is_proposal_expired(ballot.proposed_at, env.ledger().timestamp(), threshold_met) {
+        return Ok(None);
+    }
+    close_ballot(env, proposal_id);
+    env.storage().instance().remove(&GOVERNANCE_UPGRADE_KEY);
+    Ok(Some(ballot.proposer))
 }
 
 #[cfg(test)]
