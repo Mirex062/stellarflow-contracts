@@ -273,6 +273,10 @@ const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
 const RECOVERY_KEY: Symbol = symbol_short!("RKEY");
 const LAST_ADMIN_ACTIVITY: Symbol = symbol_short!("LASTACT");
 
+const PROPOSAL_STATE_KEY: Symbol = symbol_short!("PROPSTATE");
+const PROPOSAL_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60;
+const EMERGENCY_REVOCATION_TOPIC: Symbol = symbol_short!("EMERG");
+
 #[contracttype]
 #[derive(Clone)]
 pub struct RevocationProposal {
@@ -281,6 +285,21 @@ pub struct RevocationProposal {
     pub proposer: Address,
     pub proposed_at: u64,
     pub votes: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    Active,
+    Approved,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ProposalState {
+    pub proposed_at: u64,
+    pub status: ProposalStatus,
 }
 
 #[contracttype]
@@ -442,7 +461,9 @@ impl TimeLockedUpgradeContract {
         if !Self::_is_signer(&env, &proposer) && data.admin != proposer {
             return Err(ContractError::Unauthorized);
         }
-        open_ballot(&env, REVOCATION_KEY, target, replacement, proposer)
+        open_ballot(&env, REVOCATION_KEY, target, replacement, proposer)?;
+        Self::_store_proposal_state(&env, REVOCATION_KEY, env.ledger().timestamp());
+        Ok(())
     }
 
     /// Cast a multi-sig vote on the active revocation ballot stored in Temporary
@@ -462,6 +483,7 @@ impl TimeLockedUpgradeContract {
             contract_data.admin = ballot.replacement.clone();
             env.storage().instance().set(&DATA_KEY, &contract_data);
             close_ballot(&env, REVOCATION_KEY);
+            Self::_remove_proposal_state(&env, REVOCATION_KEY);
         }
         Ok(())
     }
@@ -513,6 +535,7 @@ impl TimeLockedUpgradeContract {
             signers: signers.clone(),
         };
         env.storage().instance().set(&GOVERNANCE_UPGRADE_KEY, &proposal);
+        Self::_store_proposal_state(&env, GOVERNANCE_UPGRADE_KEY, staged_at);
 
         let staged = StagedUpgrade {
             new_wasm_hash: new_wasm_hash.clone(),
@@ -565,6 +588,7 @@ impl TimeLockedUpgradeContract {
         // Run post-upgrade diagnostic health checks
         Self::_run_post_upgrade_health_check(&env, pre_upgrade_data)?;
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
+        Self::_remove_proposal_state(&env, GOVERNANCE_UPGRADE_KEY);
         crate::instance::bump_instance_ttl(&env);
         Ok(())
     }
@@ -621,6 +645,7 @@ impl TimeLockedUpgradeContract {
         canceller.require_auth();
         env.storage().instance().remove(&PENDING_UPGRADE_KEY);
         env.storage().instance().remove(&crate::governance::GOVERNANCE_UPGRADE_KEY);
+        Self::_remove_proposal_state(&env, GOVERNANCE_UPGRADE_KEY);
         Self::_extend_instance_ttl(&env);
         crate::instance::bump_instance_ttl(&env);
         Ok(())
@@ -1191,7 +1216,9 @@ impl TimeLockedUpgradeContract {
         replacement: Address,
         nonce: u64,
     ) -> Result<(), ContractError> {
-        admin::propose_emergency_revocation(&env, proposer, target, replacement, nonce)
+        admin::propose_emergency_revocation(&env, proposer, target, replacement, nonce)?;
+        Self::_store_proposal_state(&env, EMERGENCY_REVOCATION_TOPIC, env.ledger().timestamp());
+        Ok(())
     }
 
     /// Explicitly purge an expired or stale emergency revocation proposal.
@@ -1217,11 +1244,50 @@ impl TimeLockedUpgradeContract {
     /// This can be called by any party since the primary security model relies on
     /// the voting threshold for proposal execution, not on proposal creation.
     pub fn purge_expired_revocation_prop(env: Env) -> Result<(), ContractError> {
-        admin::purge_emergency_revocation_proposal(&env)
+        let result = admin::purge_emergency_revocation_proposal(&env);
+        if result.is_ok() {
+            Self::_remove_proposal_state(&env, EMERGENCY_REVOCATION_TOPIC);
+        }
+        result
     }
 
     pub fn has_active_revocation_proposal(env: Env) -> bool {
         admin::has_active_emergency_revocation(&env)
+    }
+
+    /// Expire multi-sig proposals whose approval threshold was not reached
+    /// within `PROPOSAL_EXPIRY_SECONDS`. Cleans the tracked proposal state and
+    /// releases any locked upgrade/revocation state so storage deposits are
+    /// reclaimed by the contract.
+    pub fn cleanup_expired_proposals(env: Env) -> Result<u32, ContractError> {
+        let mut expired_count = 0u32;
+        let now = env.ledger().timestamp();
+        let states: Map<Symbol, ProposalState> = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_STATE_KEY)
+            .unwrap_or_else(|| Map::new(&env));
+        let topics: Vec<Symbol> = states.keys();
+        for topic_ref in topics.iter() {
+            let topic = *topic_ref;
+            if let Some(state) = states.get(&topic) {
+                if state.status == ProposalStatus::Active
+                    && now.saturating_sub(state.proposed_at) >= PROPOSAL_EXPIRY_SECONDS
+                {
+                    if topic == REVOCATION_KEY {
+                        close_ballot(&env, REVOCATION_KEY);
+                    } else if topic == GOVERNANCE_UPGRADE_KEY {
+                        env.storage().instance().remove(&GOVERNANCE_UPGRADE_KEY);
+                        env.storage().instance().remove(&PENDING_UPGRADE_KEY);
+                    } else if topic == EMERGENCY_REVOCATION_TOPIC {
+                        admin::purge_emergency_revocation_proposal(&env)?;
+                    }
+                    Self::_mark_proposal_expired(&env, topic);
+                    expired_count = expired_count.saturating_add(1);
+                }
+            }
+        }
+        Ok(expired_count)
     }
 
     // ── Governance Proposal Veto Engine (Issue #769) ────────────────────────────
@@ -1738,6 +1804,39 @@ impl TimeLockedUpgradeContract {
 
     fn _extend_instance_ttl(env: &Env) {
         env.storage().instance().extend_ttl(RELAYER_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+    }
+
+    fn _store_proposal_state(env: &Env, topic: Symbol, proposed_at: u64) {
+        let mut states: Map<Symbol, ProposalState> = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_STATE_KEY)
+            .unwrap_or_else(|| Map::new(env));
+        states.set(topic, ProposalState { proposed_at, status: ProposalStatus::Active });
+        env.storage().instance().set(&PROPOSAL_STATE_KEY, &states);
+    }
+
+    fn _mark_proposal_expired(env: &Env, topic: Symbol) {
+        let mut states: Map<Symbol, ProposalState> = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_STATE_KEY)
+            .unwrap_or_else(|| Map::new(env));
+        if let Some(mut state) = states.get(&topic) {
+            state.status = ProposalStatus::Expired;
+            states.set(topic, state);
+            env.storage().instance().set(&PROPOSAL_STATE_KEY, &states);
+        }
+    }
+
+    fn _remove_proposal_state(env: &Env, topic: Symbol) {
+        let mut states: Map<Symbol, ProposalState> = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_STATE_KEY)
+            .unwrap_or_else(|| Map::new(env));
+        states.remove(topic);
+        env.storage().instance().set(&PROPOSAL_STATE_KEY, &states);
     }
 
     fn assert_contract_is_active(env: &Env) -> Result<(), ContractError> {
