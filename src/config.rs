@@ -191,6 +191,39 @@ pub fn get_price_variance_config(env: &Env) -> PriceVarianceConfig {
         .unwrap_or_default()
 }
 
+// ── Multi-sig proposal expiry ────────────────────────────────────────────────
+
+/// Default time-to-live for a multi-sig proposal before it can be expired.
+///
+/// 604_800 s = 7 days.
+pub const DEFAULT_PROPOSAL_EXPIRY_SECS: u64 = 604_800;
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProposalCreationKey {
+    pub proposal_id: u32,
+}
+
+/// Store the ledger timestamp at which a multi-sig proposal was created.
+pub fn set_proposal_creation_ledger_timestamp(env: &Env, proposal_id: u32, created_at: u64) {
+    env.storage()
+        .instance()
+        .set(&ProposalCreationKey { proposal_id }, &created_at);
+}
+
+/// Read the stored creation ledger timestamp for a proposal, if any.
+pub fn get_proposal_creation_ledger_timestamp(env: &Env, proposal_id: u32) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&ProposalCreationKey { proposal_id })
+}
+
+/// Return `true` when a proposal created at `created_at` has exceeded the
+/// 7-day approval window as of the current ledger timestamp.
+pub fn is_proposal_expired(env: &Env, created_at: u64) -> bool {
+    env.ledger().timestamp().saturating_sub(created_at) >= DEFAULT_PROPOSAL_EXPIRY_SECS
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
