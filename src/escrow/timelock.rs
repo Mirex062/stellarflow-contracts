@@ -22,7 +22,7 @@ pub enum PaymentState {
 pub const PAYOUT_TIMEOUT_LEDGERS: u32 = 17280;
 
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Escrow {
     pub sender: Address,
     pub receiver: Address,
@@ -36,6 +36,13 @@ pub struct Escrow {
     pub receiver_approved: bool,
     pub released: bool,
     pub state: PaymentState,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStorageKey {
+    NextEscrowId,
+    Escrow(u64),
 }
 
 impl Escrow {
