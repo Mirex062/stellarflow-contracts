@@ -122,12 +122,14 @@ pub fn compute_swap_out(
         return Err(ContractError::InvalidInput);
     }
     
-    // Update volume history and get current dynamic fee
-    let fee_bps = crate::TimeLockedUpgradeContract::update_volume_and_get_fee(
+    // Update volume history and derive the base dynamic fee, then apply the
+    // volatility-based adaptive scaling (Issue #766) when the pool opted in.
+    let legacy_fee_bps = crate::fees::update_volume_and_adjust_fee(
         env, 
         asset, 
         amount_in as u64
     )?;
+    let fee_bps = crate::fees::resolve_swap_fee_bps(env, asset, legacy_fee_bps)?;
     
     // Calculate raw output before fees
     let denominator = reserve_in
@@ -136,7 +138,7 @@ pub fn compute_swap_out(
     let raw_output = mul_div(reserve_out, amount_in, denominator)?;
     
     // Apply dynamic fee deduction
-    let (amount_after_fees, fee_amount) = crate::TimeLockedUpgradeContract::calculate_and_deduct_fee(
+    let (amount_after_fees, fee_amount) = crate::fees::calculate_and_deduct_fee(
         raw_output, 
         fee_bps
     )?;
