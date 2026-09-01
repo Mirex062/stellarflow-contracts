@@ -4,7 +4,7 @@
 //! `INTERIOR_SCALE` (10^14) before division, then normalize back to the
 //! standard 10^7 fixed-point footprint prior to ledger mutations.
 
-use crate::{AssetId, ContractError, TimeLockedUpgradeContract};
+use crate::{AssetId, ContractData, ContractError, TimeLockedUpgradeContract, DATA_KEY};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 pub const STANDARD_FIXED_POINT_SCALE: i128 = 10_000_000;
@@ -240,7 +240,11 @@ pub fn add_corridor_fees(
     admin.require_auth();
     // Reject dust deposits that fall below the minimum transfer threshold.
     crate::validation::dust::check_min_transfer(collected)?;
-    let data = TimeLockedUpgradeContract::load_data(&env)?;
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
     if data.admin != admin {
         return Err(ContractError::NotAdmin);
     }
@@ -349,6 +353,26 @@ pub fn get_current_dynamic_fee(env: &Env, asset: AssetId) -> u32 {
     dynamic_fee.current_fee_bps
 }
 
+/// Resolve the swap fee to apply for a pool (Issue #766).
+///
+/// If the pool has opted into adaptive (volatility-based) fee scaling, returns
+/// the volatility-scaled fee that lies within the configured `[base, max]`
+/// band. Otherwise falls back to the provided legacy fee unchanged, so pools
+/// that never configured an [`AdaptiveFeeConfig`] keep their existing
+/// volume-based dynamic fee behavior.
+pub fn resolve_swap_fee_bps(
+    env: &Env,
+    pool: AssetId,
+    legacy_fee_bps: u32,
+) -> Result<u32, ContractError> {
+    if crate::config::get_adaptive_fee_config(env, pool).is_some() {
+        let (fee, _vol) = crate::amm::adaptive_fee::resolve_adaptive_fee(env, pool)?;
+        Ok(fee)
+    } else {
+        Ok(legacy_fee_bps)
+    }
+}
+
 /// Calculate and deduct dynamic fee from a trade amount
 pub fn calculate_and_deduct_fee(amount: u128, fee_bps: u32) -> Result<(u128, u128), ContractError> {
     // Fee is calculated as (amount * fee_bps) / 10000 (since bps is 1/100th of a percent)
@@ -375,7 +399,11 @@ pub fn set_dynamic_fee_config(
     period_seconds: u64,
 ) -> Result<(), ContractError> {
     caller.require_auth();
-    let data = TimeLockedUpgradeContract::load_data(env)?;
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
     if data.admin != *caller {
         return Err(ContractError::NotAdmin);
     }
@@ -418,7 +446,11 @@ pub fn set_corridor_weight(
     dynamic_weight: u64,
 ) -> Result<CorridorWeightProfile, ContractError> {
     admin.require_auth();
-    let data = TimeLockedUpgradeContract::load_data(&env)?;
+    let data: ContractData = env
+        .storage()
+        .instance()
+        .get(&DATA_KEY)
+        .ok_or(ContractError::NotInitialized)?;
     if data.admin != admin {
         return Err(ContractError::NotAdmin);
     }
@@ -623,7 +655,7 @@ pub fn distribute_flash_fees(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TimeLockedUpgradeContractClient;
+    use crate::{TimeLockedUpgradeContract, TimeLockedUpgradeContractClient};
     use soroban_sdk::testutils::Address as _;
 
     fn setup() -> (Env, TimeLockedUpgradeContractClient<'static>, Address, Address) {
