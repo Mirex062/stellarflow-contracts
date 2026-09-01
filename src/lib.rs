@@ -828,6 +828,22 @@ impl TimeLockedUpgradeContract {
         )
     }
 
+    pub fn deposit_single_asset(
+        env: Env,
+        provider: Address,
+        asset: AssetId,
+        amount_in: u128,
+        is_asset_a: bool,
+    ) -> Result<(settlement::fees::LiquidityPosition, u128, u128), ContractError> {
+        settlement::fees::deposit_single_asset(
+            &env,
+            provider,
+            asset,
+            amount_in,
+            is_asset_a,
+        )
+    }
+
     pub fn redeem_lp_liquidity(
         env: Env,
         provider: Address,
