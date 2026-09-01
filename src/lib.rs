@@ -285,6 +285,10 @@ const REVOCATION_KEY: Symbol = symbol_short!("REVOKE");
 const RECOVERY_KEY: Symbol = symbol_short!("RKEY");
 const LAST_ADMIN_ACTIVITY: Symbol = symbol_short!("LASTACT");
 
+/// Auto-refund window for locked fiat escrows: the anchor must claim the
+/// payout within 24 hours or the sender may reclaim the locked funds.
+pub const FIAT_PAYOUT_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct RevocationProposal {
@@ -349,6 +353,48 @@ pub enum StakingStorageKey {
     TierConfig,
     AssetMetrics(Symbol),
     FeedStake(Address, Symbol),
+}
+
+// Storage key newtype wrappers
+#[contracttype] pub struct HeartbeatKey(pub AssetId);
+#[contracttype] pub struct CorridorFeeKey(pub Symbol);
+
+// CorridorFeePool is imported/used from the fees module
+
+// AssetMetrics key wrapper
+#[contracttype] pub struct AssetMetricsKey(pub AssetId);
+
+/// Lifecycle states for a cross-border fiat settlement escrow.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FiatSettlementState {
+    Pending,
+    Locked,
+    Dispatched,
+    Settled,
+    Refunded,
+}
+
+/// A single cross-border fiat settlement escrow record.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FiatEscrow {
+    pub id: u64,
+    pub sender: Address,
+    pub anchor: Address,
+    pub amount: u64,
+    pub asset: AssetId,
+    pub state: FiatSettlementState,
+    pub created_at: u64,
+    pub locked_at: u64,
+    pub timeout_secs: u64,
+}
+
+/// Persistent storage keys for the fiat settlement escrow subsystem.
+#[contracttype]
+pub enum FiatEscrowKey {
+    Escrow(u64),
+    Counter,
 }
 
 #[contract]
@@ -1892,10 +1938,108 @@ impl TimeLockedUpgradeContract {
         admin::is_revoked(&env, &addr)
     }
 
+    // ── Cross-Border Fiat Escrow Settlement ──────────────────────────────
+
+    /// Open a new fiat settlement escrow in the `Pending` state.
+    pub fn open_fiat_escrow(
+        env: Env, sender: Address, anchor: Address, asset: AssetId, amount: u64,
+    ) -> Result<FiatEscrow, ContractError> {
+        if amount == 0 { return Err(ContractError::AmountTooLow); }
+        sender.require_auth();
+        let id: u64 = env.storage().persistent().get(&FiatEscrowKey::Counter).unwrap_or(0u64);
+        let next = id.checked_add(1).ok_or(ContractError::Overflow)?;
+        let now = env.ledger().timestamp();
+        let escrow = FiatEscrow {
+            id,
+            sender: sender.clone(),
+            anchor,
+            amount,
+            asset,
+            state: FiatSettlementState::Pending,
+            created_at: now,
+            locked_at: 0,
+            timeout_secs: FIAT_PAYOUT_TIMEOUT_SECS,
+        };
+        env.storage().persistent().set(&FiatEscrowKey::Escrow(id), &escrow);
+        env.storage().persistent().set(&FiatEscrowKey::Counter, &next);
+        Ok(escrow)
+    }
+
+    /// Lock the sender's funds, transitioning `Pending` -> `Locked` and
+    /// starting the 24h anchor-claim countdown.
+    pub fn lock_fiat_escrow(env: Env, sender: Address, escrow_id: u64) -> Result<FiatEscrow, ContractError> {
+        sender.require_auth();
+        let mut escrow: FiatEscrow = env.storage().persistent()
+            .get(&FiatEscrowKey::Escrow(escrow_id)).ok_or(ContractError::NotRegistered)?;
+        if escrow.sender != sender { return Err(ContractError::Unauthorized); }
+        if escrow.state != FiatSettlementState::Pending { return Err(ContractError::Unauthorized); }
+        escrow.state = FiatSettlementState::Locked;
+        escrow.locked_at = env.ledger().timestamp();
+        env.storage().persistent().set(&FiatEscrowKey::Escrow(escrow_id), &escrow);
+        Ok(escrow)
+    }
+
+    /// Anchor marks the off-chain fiat payout as dispatched, transitioning
+    /// `Locked` -> `Dispatched`.
+    pub fn dispatch_fiat_payout(env: Env, anchor: Address, escrow_id: u64) -> Result<FiatEscrow, ContractError> {
+        anchor.require_auth();
+        let mut escrow: FiatEscrow = env.storage().persistent()
+            .get(&FiatEscrowKey::Escrow(escrow_id)).ok_or(ContractError::NotRegistered)?;
+        if escrow.anchor != anchor { return Err(ContractError::Unauthorized); }
+        if escrow.state != FiatSettlementState::Locked { return Err(ContractError::Unauthorized); }
+        if Self::_fiat_escrow_expired(&env, &escrow) { return Err(ContractError::DeadlineReached); }
+        escrow.state = FiatSettlementState::Dispatched;
+        env.storage().persistent().set(&FiatEscrowKey::Escrow(escrow_id), &escrow);
+        Ok(escrow)
+    }
+
+    /// Anchor keypair signals fiat payout completion, releasing the escrowed
+    /// funds and transitioning `Locked`/`Dispatched` -> `Settled`.
+    pub fn settle_fiat_escrow(env: Env, anchor: Address, escrow_id: u64) -> Result<FiatEscrow, ContractError> {
+        anchor.require_auth();
+        let mut escrow: FiatEscrow = env.storage().persistent()
+            .get(&FiatEscrowKey::Escrow(escrow_id)).ok_or(ContractError::NotRegistered)?;
+        if escrow.anchor != anchor { return Err(ContractError::Unauthorized); }
+        match escrow.state {
+            FiatSettlementState::Locked | FiatSettlementState::Dispatched => {}
+            _ => return Err(ContractError::Unauthorized),
+        }
+        if Self::_fiat_escrow_expired(&env, &escrow) { return Err(ContractError::DeadlineReached); }
+        escrow.state = FiatSettlementState::Settled;
+        env.storage().persistent().set(&FiatEscrowKey::Escrow(escrow_id), &escrow);
+        Ok(escrow)
+    }
+
+    /// Reclaim locked funds for the sender once the 24h anchor-claim window
+    /// has elapsed without settlement, transitioning to `Refunded`.
+    pub fn refund_fiat_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<FiatEscrow, ContractError> {
+        caller.require_auth();
+        let mut escrow: FiatEscrow = env.storage().persistent()
+            .get(&FiatEscrowKey::Escrow(escrow_id)).ok_or(ContractError::NotRegistered)?;
+        match escrow.state {
+            FiatSettlementState::Locked | FiatSettlementState::Dispatched => {}
+            _ => return Err(ContractError::Unauthorized),
+        }
+        if !Self::_fiat_escrow_expired(&env, &escrow) {
+            return Err(ContractError::DeadlineNotReached);
+        }
+        escrow.state = FiatSettlementState::Refunded;
+        env.storage().persistent().set(&FiatEscrowKey::Escrow(escrow_id), &escrow);
+        Ok(escrow)
+    }
+
+    /// Read a fiat settlement escrow record by id.
+    pub fn get_fiat_escrow(env: Env, escrow_id: u64) -> Option<FiatEscrow> {
+        env.storage().persistent().get(&FiatEscrowKey::Escrow(escrow_id))
+    }
+
     // --- Private Helpers ---
 
-    fn _extend_instance_ttl(env: &Env) {
-        env.storage().instance().extend_ttl(RELAYER_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+    /// Returns `true` when a locked escrow has passed its anchor-claim
+    /// timeout window. Escrows that have never been locked never expire.
+    fn _fiat_escrow_expired(env: &Env, escrow: &FiatEscrow) -> bool {
+        if escrow.locked_at == 0 { return false; }
+        env.ledger().timestamp().saturating_sub(escrow.locked_at) >= escrow.timeout_secs
     }
 
     fn assert_contract_is_active(env: &Env) -> Result<(), ContractError> {
