@@ -210,7 +210,7 @@ mod tests {
         env.as_contract(&cid, || {
             env.storage().instance().set(
                 &DATA_KEY,
-                &ContractData { admin: admin.clone(), value: 0 },
+                &ContractData { admin: admin.clone(), value: 0, max_fee_ceiling: 0 },
             );
             env.storage().instance().set(&SignerKey::SignerByAddress(signer_a.clone()), &true);
             env.storage().instance().set(&SignerKey::SignerByAddress(signer_b.clone()), &true);
@@ -365,7 +365,7 @@ mod tests {
         env.as_contract(&cid, || {
             env.storage().instance().set(
                 &DATA_KEY,
-                &ContractData { admin: admin.clone(), value: 0 },
+                &ContractData { admin: admin.clone(), value: 0, max_fee_ceiling: 0 },
             );
         });
 
